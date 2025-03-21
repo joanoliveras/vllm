@@ -304,6 +304,79 @@ def calculate_metrics(
 
     return metrics, actual_output_lens
 
+class MultiServer:
+    def __init__(self, server_args: str, output_path: str, num_servers: int, base_port: int = 8000):
+        """
+        Initialize multiple vLLM server instances.
+        """
+        self.server_args = server_args
+        self.output_path = output_path
+        self.num_servers = num_servers
+        self.base_port = base_port
+        self.servers = []
+        self.processes = []
+        
+        # Create output directories if they don't exist
+        os.makedirs(output_path, exist_ok=True)
+        
+        # Initialize server instances with different ports
+        for i in range(num_servers):
+            server_port = base_port + i
+            server_specific_args = f"{server_args} --port {server_port}"
+            server_out = open(os.path.join(self.output_path, f'server_{i}_out.log'), 'w')
+            server_err = open(os.path.join(self.output_path, f'server_{i}_err.log'), 'w')
+            
+            self.servers.append({
+                'id': i,
+                'port': server_port,
+                'args': server_specific_args,
+                'out': server_out,
+                'err': server_err
+            })
+
+    def run(self) -> list:
+        """Launch all server instances and return their processes"""
+        try:
+            for server in self.servers:
+                command = f'python3 -m vllm.entrypoints.openai.api_server {server["args"]}'
+                process = subprocess.Popen(
+                    shlex.split(command),
+                    shell=False,
+                    cwd='/',
+                    stdout=server['out'],
+                    stderr=server['err']
+                )
+                self.processes.append(process)
+                print(f"Started server {server['id']} on port {server['port']}")
+                # Small delay between server starts to avoid resource contention
+                time.sleep(1)
+            
+            return self.processes
+        except Exception as e:
+            print(f"Error starting servers: {e}")
+            self.terminate(self.processes)
+            raise e
+
+    def terminate(self, processes: list) -> None:
+        """Terminate all server processes and close log files"""
+        for i, process in enumerate(processes):
+            try:
+                process.kill()
+                process.terminate()
+                process.wait()
+            except Exception as e:
+                print(f"Error terminating server {i}: {e}")
+        
+        # Close all log files
+        for server in self.servers:
+            if 'out' in server and server['out']:
+                server['out'].close()
+            if 'err' in server and server['err']:
+                server['err'].close()
+                
+    def get_server_urls(self):
+        """Return a list of server URLs"""
+        return [f"http://127.0.0.1:{server['port']}" for server in self.servers]
 
 class Server:
 
@@ -965,23 +1038,66 @@ def main(args: argparse.Namespace):
     try:
         # Launch server if requested
         if hasattr(args, 'launch_server') and args.launch_server:
-            server = Server(args.server_args, args.result_dir)
-            open_server_process = server.run()
+            if args.num_servers > 1:
+                # Use MultiServer for multiple servers
+                multi_server = MultiServer(args.server_args, args.result_dir, args.num_servers, args.port)
+                open_server_processes = multi_server.run()
 
-            max_wait_for_server_seconds = 300
-            init_time = time.time()
-            server_started = False
-            while not server_started and time.time() - init_time < max_wait_for_server_seconds:
-                try:
-                    if requests.get(metrics_api_url).status_code == 200:
-                        server_started = True
-                    else:
+                # Get server URLs
+                base_urls = multi_server.get_server_urls()
+                api_urls = [f"{url}{args.endpoint}" for url in base_urls]
+                metrics_api_urls = [f"{url}/metrics/" for url in base_urls]
+
+                # Health check for all servers
+                max_wait_for_server_seconds = 300
+                init_time = time.time()
+                
+                # Track which servers have successfully started
+                server_started_status = [False] * args.num_servers
+                
+                # Wait for all servers to start or timeout
+                while not all(server_started_status) and time.time() - init_time < max_wait_for_server_seconds:
+                    for i, metrics_url in enumerate(metrics_api_urls):
+                        if not server_started_status[i]:
+                            try:
+                                response = requests.get(metrics_url, timeout=5)
+                                if response.status_code == 200:
+                                    server_started_status[i] = True
+                                    print(f"Server {i} on port {args.port + i} started successfully")
+                            except Exception:
+                                # Continue if the server isn't ready yet
+                                pass
+                            
+                    # If not all servers are up, wait before checking again
+                    if not all(server_started_status):
                         time.sleep(5)
-                except Exception as e:
-                    time.sleep(5)
-            if not server_started:
-                raise Exception("Server did not start on time")
-            print("Server started")
+
+                # Check if all servers started successfully
+                if not all(server_started_status):
+                    # Identify which servers failed to start
+                    failed_servers = [i for i, status in enumerate(server_started_status) if not status]
+                    multi_server.terminate(open_server_processes)
+                    raise Exception(f"Servers {failed_servers} did not start on time")
+
+                print(f"All {args.num_servers} servers started successfully")
+            else:
+                # Use original Server class for single server
+                server = Server(args.server_args, args.result_dir)
+                open_server_process = server.run()
+                max_wait_for_server_seconds = 300
+                init_time = time.time()
+                server_started = False
+                while not server_started and time.time() - init_time < max_wait_for_server_seconds:
+                    try:
+                        if requests.get(metrics_api_url).status_code == 200:
+                            server_started = True
+                        else:
+                            time.sleep(5)
+                    except Exception as e:
+                        time.sleep(5)
+                if not server_started:
+                    raise Exception("Server did not start on time")
+                print("Server started")
 
         # Set up request rate
         request_rate = args.request_rate
@@ -1135,11 +1251,14 @@ def main(args: argparse.Namespace):
             print(f"Error while terminating metrics checker: {e}")
             
         try:
-            if server and open_server_process:
+            if args.num_servers > 1 and 'multi_server' in locals():
+                multi_server.terminate(open_server_processes)
+                print('All servers terminated')
+            elif server and open_server_process:
                 server.terminate(open_server_process)
                 print('Server terminated')
         except Exception as e:
-            print(f"Error while terminating server: {e}")
+            print(f"Error while terminating servers: {e}")
 
 
 if __name__ == "__main__":
@@ -1151,7 +1270,13 @@ if __name__ == "__main__":
         default="vllm",
         choices=list(ASYNC_REQUEST_FUNCS.keys()),
     )
-    
+    # MultiServer argument.
+    parser.add_argument(
+    "--num-servers",
+    type=int,
+    default=1,
+    help="Number of vLLM server instances to launch (only used with --launch-server)",
+    )
     # Add new server-related arguments
     parser.add_argument(
         "--launch-server",
