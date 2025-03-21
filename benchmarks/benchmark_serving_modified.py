@@ -304,6 +304,99 @@ def calculate_metrics(
 
     return metrics, actual_output_lens
 
+class RouterServer:
+    def __init__(self, output_path: str, router_port: int, server_ports: list, 
+                 base_model: str, lora_adapters: list):
+        """
+        Initialize and run the vLLM router
+        
+        Args:
+            output_path: Directory to save router logs
+            router_port: Port for the router service
+            server_ports: List of ports where vLLM servers are running
+            base_model: Base model name
+            lora_adapters: List of LoRA adapters loaded on the servers
+        """
+        self.output_path = output_path
+        self.router_port = router_port
+        self.server_ports = server_ports
+        self.base_model = base_model
+        self.lora_adapters = lora_adapters
+        self.router_out = None
+        self.router_err = None
+        self.process = None
+        
+    def run(self) -> Popen:
+        try:
+            self.router_out = open(os.path.join(self.output_path, 'router_out.log'), 'w')
+            self.router_err = open(os.path.join(self.output_path, 'router_err.log'), 'w')
+            
+            # Build static backends list (each server duplicated for each model it serves)
+            backends = []
+            models = []
+            
+            # Add base model for each server
+            for port in self.server_ports:
+                backends.append(f"http://localhost:{port}")
+                models.append(self.base_model)
+            
+            # Add LoRA adapters for each server
+            for adapter in self.lora_adapters:
+                for port in self.server_ports:
+                    backends.append(f"http://localhost:{port}")
+                    models.append(adapter)
+            
+            static_backends = ",".join(backends)
+            static_models = ",".join(models)
+            
+            # Build router command with default settings
+            command = (
+                    f"python3 /Users/joanoliverastorra/Documents/IBM/production_stack/src/vllm_router/app.py --port {self.router_port} " #TODO script path is hardcoded. To be improved. pip nstall -e . is needed.
+                    f"--service-discovery static "
+                    f"--static-backends \"{static_backends}\" "
+                    f"--static-models \"{static_models}\" "
+                    f"--log-stats "
+                    f"--log-stats-interval 10 "
+                    f"--engine-stats-interval 10 "
+                    f"--request-stats-window 10 "
+                    f"--routing-logic roundrobin "
+                )
+            
+            print(f"Starting router with command: {command}")
+            
+            process = subprocess.Popen(
+                shlex.split(command),
+                shell=False,
+                cwd='/',
+                stdout=self.router_out,
+                stderr=self.router_err
+            )
+            
+            self.process = process
+            return process
+            
+        except Exception as e:
+            print(f"Error starting router: {e}")
+            if self.router_out:
+                self.router_out.close()
+            if self.router_err:
+                self.router_err.close()
+            raise e
+            
+    def terminate(self) -> None:
+        if self.process:
+            try:
+                self.process.kill()
+                self.process.terminate()
+                self.process.wait()
+            except Exception as e:
+                print(f"Error terminating router: {e}")
+        
+        if self.router_out:
+            self.router_out.close()
+        if self.router_err:
+            self.router_err.close()
+
 class MultiServer:
     def __init__(self, server_args: str, output_path: str, num_servers: int, base_port: int = 8000):
         """
@@ -347,8 +440,6 @@ class MultiServer:
                     stderr=server['err']
                 )
                 self.processes.append(process)
-                print(f"Started server {server['id']} on port {server['port']}")
-                # Small delay between server starts to avoid resource contention
                 time.sleep(1)
             
             return self.processes
@@ -1039,7 +1130,9 @@ def main(args: argparse.Namespace):
         # Launch server if requested
         if hasattr(args, 'launch_server') and args.launch_server:
             if args.num_servers > 1:
+                server_ports = [args.port + i for i in range(args.num_servers)]
                 # Use MultiServer for multiple servers
+                print(f"Starting {args.num_servers} vLLM servers...")
                 multi_server = MultiServer(args.server_args, args.result_dir, args.num_servers, args.port)
                 open_server_processes = multi_server.run()
 
@@ -1080,6 +1173,54 @@ def main(args: argparse.Namespace):
                     raise Exception(f"Servers {failed_servers} did not start on time")
 
                 print(f"All {args.num_servers} servers started successfully")
+                
+                # When using multiple servers, always use the router
+                # Extract LoRA adapters info from server args
+                available_loras = []
+                if "--enable-lora" in args.server_args and "--lora-modules" in args.server_args:
+                    # Extract the lora modules from server args
+                    lora_modules_str = args.server_args.split("--lora-modules ")[1].split(" ")[0]
+                    # Parse the format 'name=path'
+                    for lora_info in lora_modules_str.split(","):
+                        if "=" in lora_info:
+                            name, _ = lora_info.split("=", 1)
+                            available_loras.append(name)
+
+                # Start the router
+                print("Starting vLLM router...")
+                router_server = RouterServer(
+                    output_path=args.result_dir,
+                    router_port=args.router_port,
+                    server_ports=server_ports,
+                    base_model=model_id,
+                    lora_adapters=available_loras
+                )
+                router_process = router_server.run()
+
+                # Update API URL to point to the router
+                api_url = f"http://{args.host}:{args.router_port}{args.endpoint}"
+                base_url = f"http://{args.host}:{args.router_port}"
+                metrics_api_url = f"http://{args.host}:{args.router_port}/metrics/"
+                models_api_url = f"http://{args.host}:{args.router_port}/v1/models/"
+
+                # Wait for router to start
+                max_wait_for_router_seconds = 60
+                init_time = time.time()
+                router_started = False
+
+                while not router_started and time.time() - init_time < max_wait_for_router_seconds:
+                    try:
+                        response = requests.get(models_api_url, timeout=5)
+                        if response.status_code == 200:
+                            router_started = True
+                            print("Router started successfully")
+                        else:
+                            time.sleep(2)
+                    except Exception:
+                        time.sleep(2)
+
+                if not router_started:
+                    raise Exception("Router failed to start within the timeout period")
             else:
                 # Use original Server class for single server
                 server = Server(args.server_args, args.result_dir)
@@ -1251,12 +1392,17 @@ def main(args: argparse.Namespace):
             print(f"Error while terminating metrics checker: {e}")
             
         try:
+            # Router cleanup
+            if args.num_servers > 1 and 'router_server' in locals():
+                router_server.terminate()
+                print('Router terminated')
+
             if args.num_servers > 1 and 'multi_server' in locals():
                 multi_server.terminate(open_server_processes)
-                print('All servers terminated')
+                print('All vLLM servers terminated')
             elif server and open_server_process:
                 server.terminate(open_server_process)
-                print('Server terminated')
+                print('vLLM Server terminated')
         except Exception as e:
             print(f"Error while terminating servers: {e}")
 
@@ -1269,6 +1415,13 @@ if __name__ == "__main__":
         type=str,
         default="vllm",
         choices=list(ASYNC_REQUEST_FUNCS.keys()),
+    )
+    # Router variables, used when using --num-servers > 1.
+    parser.add_argument(
+        "--router-port",
+        type=int,
+        default=8080,
+        help="Port for the vllm_router service",
     )
     # MultiServer argument.
     parser.add_argument(
