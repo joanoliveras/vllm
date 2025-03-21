@@ -34,7 +34,12 @@ import warnings
 from collections.abc import AsyncGenerator, Iterable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Optional, List, Tuple, Dict
+import shlex
+import requests
+import subprocess
+from subprocess import Popen
+from concurrent_metrics_checker import ConcurrentMetricsChecker
 
 import numpy as np
 from backend_request_func import (ASYNC_REQUEST_FUNCS, RequestFuncInput,
@@ -67,9 +72,12 @@ class BenchmarkMetrics:
     total_output: int
     request_throughput: float
     request_goodput: float
+    input_throughput: float
     output_throughput: float
     total_token_throughput: float
     mean_ttft_ms: float
+    mean_ttfts_ms_by_lora: Dict[str, float]
+    mean_ttfts_ms_by_user: Dict[str, float]
     median_ttft_ms: float
     std_ttft_ms: float
     percentiles_ttft_ms: list[tuple[float, float]]
@@ -92,9 +100,11 @@ class BenchmarkMetrics:
 
 async def get_request(
     input_requests: list[SampleRequest],
-    request_rate: float,
+    input_requests_loras: List[str] = None,
+    input_requests_users: List[str] = None,
+    request_rate: float = float("inf"),
     burstiness: float = 1.0,
-) -> AsyncGenerator[SampleRequest, None]:
+) -> AsyncGenerator[tuple[SampleRequest, Optional[str], Optional[str]], None]:
     """
     Asynchronously generates requests at a specified rate
     with OPTIONAL burstiness.
@@ -102,6 +112,10 @@ async def get_request(
     Args:
         input_requests:
             A list of input requests, each represented as a SampleRequest.
+        input_requests_loras:
+            A list of LoRA adapter names to use for each request.
+        input_requests_users:
+            A list of user IDs to associate with each request.
         request_rate:
             The rate at which requests are generated (requests/s).
         burstiness (optional):
@@ -120,8 +134,10 @@ async def get_request(
         f"A positive burstiness factor is expected, but given {burstiness}.")
     theta = 1.0 / (request_rate * burstiness)
 
-    for request in input_requests:
-        yield request
+    for index, request in enumerate(input_requests):
+        lora = input_requests_loras[index] if input_requests_loras else None
+        user = input_requests_users[index] if input_requests_users else None
+        yield request, lora, user
 
         if request_rate == float("inf"):
             # If the request rate is infinity, then we don't need to wait.
@@ -142,6 +158,8 @@ def calculate_metrics(
     selected_percentile_metrics: list[str],
     selected_percentiles: list[float],
     goodput_config_dict: dict[str, float],
+    input_requests_loras: List[str] = None,
+    input_requests_users: List[str] = None,
 ) -> tuple[BenchmarkMetrics, list[int]]:
     actual_output_lens: list[int] = []
     total_input = 0
@@ -152,6 +170,9 @@ def calculate_metrics(
     all_tpots: list[float] = []
     ttfts: list[float] = []
     e2els: list[float] = []
+    # Add tracking for LoRAs and users
+    ttfts_by_lora: Dict[str, List[float]] = {}
+    ttfts_by_user: Dict[str, List[float]] = {}
     for i in range(len(outputs)):
         if outputs[i].success:
             output_len = outputs[i].output_tokens
@@ -177,9 +198,49 @@ def calculate_metrics(
             itls += outputs[i].itl
             ttfts.append(outputs[i].ttft)
             e2els.append(outputs[i].latency)
+            # Track ttfts by LoRA and user if available
+            if input_requests_loras:
+                request_lora: str = input_requests_loras[i]
+                if request_lora in ttfts_by_lora:
+                    ttfts_by_lora[request_lora] += [outputs[i].ttft]
+                else:
+                    ttfts_by_lora[request_lora] = [outputs[i].ttft]
+                    
+            if input_requests_users:
+                request_user: str = input_requests_users[i]
+                if request_user in ttfts_by_user:
+                    ttfts_by_user[request_user] += [outputs[i].ttft]
+                else:
+                    ttfts_by_user[request_user] = [outputs[i].ttft]
+                    
             completed += 1
         else:
             actual_output_lens.append(0)
+            # Add LoRA and user tracking for failed requests
+            if input_requests_loras:
+                request_lora: str = input_requests_loras[i]
+                ttft_value = dur_s  # Use duration as TTFT for failed requests
+                if request_lora in ttfts_by_lora:
+                    ttfts_by_lora[request_lora] += [ttft_value]
+                else:
+                    ttfts_by_lora[request_lora] = [ttft_value]
+                    
+            if input_requests_users:
+                request_user: str = input_requests_users[i]
+                ttft_value = dur_s  # Use duration as TTFT for failed requests
+                if request_user in ttfts_by_user:
+                    ttfts_by_user[request_user] += [ttft_value]
+                else:
+                    ttfts_by_user[request_user] = [ttft_value]
+
+    # Calculate mean TTFTs by LoRA and user
+    mean_ttfts_by_lora: Dict[str, float] = {}
+    for lora, values in ttfts_by_lora.items():
+        mean_ttfts_by_lora[lora] = np.mean(values or 0) * 1000
+        
+    mean_ttfts_by_user: Dict[str, float] = {}
+    for user, values in ttfts_by_user.items():
+        mean_ttfts_by_user[user] = np.mean(values or 0) * 1000
 
     if goodput_config_dict:
         valid_metrics = []
@@ -214,12 +275,14 @@ def calculate_metrics(
         total_output=sum(actual_output_lens),
         request_throughput=completed / dur_s,
         request_goodput=good_completed / dur_s,
+        input_throughput=total_input / dur_s,
         output_throughput=sum(actual_output_lens) / dur_s,
         total_token_throughput=(total_input + sum(actual_output_lens)) / dur_s,
-        mean_ttft_ms=np.mean(ttfts or 0) *
-        1000,  # ttfts is empty if streaming is not supported by backend
-        std_ttft_ms=np.std(ttfts or 0) * 1000,
+        mean_ttft_ms=np.mean(ttfts or 0) * 1000,
+        mean_ttfts_ms_by_lora=mean_ttfts_by_lora,
+        mean_ttfts_ms_by_user=mean_ttfts_by_user,
         median_ttft_ms=np.median(ttfts or 0) * 1000,
+        std_ttft_ms=np.std(ttfts or 0) * 1000,
         percentiles_ttft_ms=[(p, np.percentile(ttfts or 0, p) * 1000)
                              for p in selected_percentiles],
         mean_tpot_ms=np.mean(tpots or 0) * 1000,
@@ -242,6 +305,46 @@ def calculate_metrics(
     return metrics, actual_output_lens
 
 
+class Server:
+
+    def __init__(self, server_args: str, output_path: str):
+        super(Server, self).__init__()
+        self.server_args = server_args
+        self.output_path = output_path
+        self.server_out = None
+        self.server_err = None
+
+    def run(self) -> Popen:
+        try:
+            self.server_out = open(os.path.join(self.output_path, 'server_out.log'), 'w')
+            self.server_err = open(os.path.join(self.output_path, 'server_err.log'), 'w')
+            command = f'python3 -m vllm.entrypoints.openai.api_server {self.server_args}'
+            open_subprocess = subprocess.Popen(
+                shlex.split(command),
+                shell=False,
+                cwd='/',
+                stdout=self.server_out,
+                stderr=self.server_err
+            )
+            return open_subprocess
+        except Exception as e:
+            print(e)
+            if self.server_out:
+                self.server_out.close()
+            if self.server_err:
+                self.server_err.close()
+            raise e
+
+    def terminate(self, open_subprocess: Popen) -> None:
+        open_subprocess.kill()
+        open_subprocess.terminate()
+        open_subprocess.wait()
+        if self.server_out:
+            self.server_out.close()
+        if self.server_err:
+            self.server_err.close()
+
+
 async def benchmark(
     backend: str,
     api_url: str,
@@ -260,8 +363,39 @@ async def benchmark(
     ignore_eos: bool,
     goodput_config_dict: dict[str, float],
     max_concurrency: Optional[int],
-    lora_modules: Optional[Iterable[str]],
+    lora_modules: Optional[Iterable[str]] = None,
+    input_requests_loras: List[str] = None,
+    input_requests_users: List[str] = None,
+    infinite_behaviour: bool = False,
+    lora_pre_loading: bool = False,
 ):
+    """
+    Run the benchmark with the given parameters.
+    
+    Args:
+        backend: Backend to use for inference
+        api_url: API URL for sending requests
+        base_url: Base URL for the server
+        model_id: Model ID to use
+        model_name: Model name for display/reporting
+        tokenizer: Tokenizer instance
+        input_requests: List of requests to benchmark
+        logprobs: Number of logprobs to return, if any
+        request_rate: Requests per second rate
+        burstiness: Burstiness factor for request generation
+        disable_tqdm: Whether to disable progress bar
+        profile: Whether to use profiling
+        selected_percentile_metrics: Metrics to report percentiles for
+        selected_percentiles: Percentiles to report
+        ignore_eos: Whether to ignore EOS tokens
+        goodput_config_dict: Configuration for goodput calculation
+        max_concurrency: Maximum number of concurrent requests
+        lora_modules: LoRA modules to use (random assignment)
+        input_requests_loras: LoRA adapter names for each request (explicit assignment)
+        input_requests_users: User IDs for each request
+        infinite_behaviour: Whether to use infinite benchmark behavior 
+        lora_pre_loading: Whether to pre-load a LoRA module
+    """
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
@@ -278,8 +412,18 @@ async def benchmark(
         raise ValueError(
             "Multi-modal content is only supported on 'openai-chat' backend.")
     assert test_mm_content is None or isinstance(test_mm_content, dict)
+   
+    # Handle LoRA and user information for test request
+    test_model_id = model_id
+    if lora_pre_loading and input_requests_loras and len(input_requests_loras) > 0:
+        test_model_id = input_requests_loras[0]
+    
+    test_user = None
+    if input_requests_users and len(input_requests_users) > 0:
+        test_user = input_requests_users[0]
+
     test_input = RequestFuncInput(
-        model=model_id,
+        model=test_model_id,
         model_name=model_name,
         prompt=test_prompt,
         api_url=api_url,
@@ -287,7 +431,7 @@ async def benchmark(
         output_len=test_output_len,
         logprobs=logprobs,
         multi_modal_content=test_mm_content,
-        ignore_eos=ignore_eos,
+        ignore_eos=ignore_eos
     )
 
     test_output = await request_func(request_func_input=test_input)
@@ -298,11 +442,10 @@ async def benchmark(
     else:
         print("Initial test run completed. Starting main benchmark run...")
 
-    if lora_modules:
-        # For each input request, choose a LoRA module at random.
-        lora_modules = iter(
-            [random.choice(lora_modules) \
-                for _ in range(len(input_requests))])
+    # Handle random LoRA module assignment if not explicitly provided
+    if lora_modules and not input_requests_loras:
+        input_requests_loras = [random.choice(list(lora_modules)) 
+                               for _ in range(len(input_requests))]
 
     if profile:
         print("Starting profiler...")
@@ -347,14 +490,23 @@ async def benchmark(
 
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
-    async for request in get_request(input_requests, request_rate, burstiness):
-        prompt, prompt_len, output_len, mm_content = request.prompt, \
-            request.prompt_len, request.expected_output_len, \
-                request.multi_modal_data
+    time_to_send = len(input_requests) / request_rate if request_rate != float("inf") else 0
+    async for request_data in get_request(input_requests, request_rate=request_rate, burstiness=burstiness,
+                                    input_requests_loras=input_requests_loras,
+                                    input_requests_users=input_requests_users,
+                                    ):
+        request, lora, user = request_data
+
+        # Extract request details
+        prompt = request.prompt
+        prompt_len = request.prompt_len
+        output_len = request.expected_output_len
+        mm_content = request.multi_modal_data
         req_model_id, req_model_name = model_id, model_name
-        if lora_modules:
-            req_lora_module = next(lora_modules)
-            req_model_id, req_model_name = req_lora_module, req_lora_module
+        if lora:
+            req_model_id = lora
+            if lora_pre_loading:
+                req_model_name = lora
 
         request_func_input = RequestFuncInput(model=req_model_id,
                                               model_name=req_model_name,
@@ -369,114 +521,207 @@ async def benchmark(
             asyncio.create_task(
                 limited_request_func(request_func_input=request_func_input,
                                      pbar=pbar)))
-    outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
-
-    if profile:
-        print("Stopping profiler...")
-        profile_input = RequestFuncInput(
-            model=model_id,
-            prompt=test_prompt,
-            api_url=base_url + "/stop_profile",
-            prompt_len=test_prompt_len,
-            output_len=test_output_len,
-            logprobs=logprobs,
+    # Handle different benchmark execution modes
+    if infinite_behaviour:
+        # For infinite mode: evaluate intermediate results after sending all requests
+        remaining_time = time_to_send - (time.perf_counter() - benchmark_start_time)
+        if remaining_time > 0:
+            await asyncio.sleep(remaining_time)
+            
+        intermediate_benchmark_duration = time.perf_counter() - benchmark_start_time
+        
+        # Collect outputs from completed tasks
+        outputs = []
+        for task in tasks:
+            if task.done():
+                outputs.append(task.result())
+            else:
+                outputs.append(None)
+        
+        # Calculate metrics for completed requests
+        metrics, actual_output_lens = calculate_metrics(
+            input_requests=input_requests,
+            outputs=outputs,
+            dur_s=intermediate_benchmark_duration,
+            tokenizer=tokenizer,
+            selected_percentile_metrics=selected_percentile_metrics,
+            selected_percentiles=selected_percentiles,
+            goodput_config_dict=goodput_config_dict,
+            input_requests_loras=input_requests_loras,
+            input_requests_users=input_requests_users,
         )
-        profile_output = await request_func(request_func_input=profile_input)
-        if profile_output.success:
-            print("Profiler stopped")
+        
+        # Generate intermediate result
+        result_intermediate = {
+            "duration": intermediate_benchmark_duration,
+            "completed": metrics.completed,
+            "total_input_tokens": metrics.total_input,
+            "total_output_tokens": metrics.total_output,
+            "request_throughput": metrics.request_throughput,
+            "request_goodput": metrics.request_goodput if goodput_config_dict else None,
+            "input_throughput": metrics.input_throughput,
+            "output_throughput": metrics.output_throughput,
+            "total_token_throughput": metrics.total_token_throughput,
+            "mean_ttft_ms": metrics.mean_ttft_ms,
+            "mean_ttfts_ms_by_lora": metrics.mean_ttfts_ms_by_lora,
+            "mean_ttfts_ms_by_user": metrics.mean_ttfts_ms_by_user,
+            "median_ttft_ms": metrics.median_ttft_ms,
+            "std_ttft_ms": metrics.std_ttft_ms,
+            "mean_tpot_ms": metrics.mean_tpot_ms,
+            "median_tpot_ms": metrics.median_tpot_ms,
+            "std_tpot_ms": metrics.std_tpot_ms,
+            "mean_itl_ms": metrics.mean_itl_ms,
+            "median_itl_ms": metrics.median_itl_ms,
+            "std_itl_ms": metrics.std_itl_ms,
+        }
 
-    if pbar is not None:
-        pbar.close()
+        # Add percentile metrics if available
+        for metric_name in selected_percentile_metrics:
+            for p, value in getattr(metrics, f"percentiles_{metric_name}_ms", []):
+                p_word = str(int(p)) if int(p) == p else str(p)
+                result_intermediate[f"p{p_word}_{metric_name}_ms"] = value
+        
+        # Print intermediate results
+        print("{s:{c}^{n}}".format(s=' Serving Benchmark Intermediate Result ', n=50, c='='))
+        print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
+        print("{:<40} {:<10.2f}".format("Benchmark duration (s):", intermediate_benchmark_duration))
+        print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
+        print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
+        print("{:<40} {:<10.2f}".format("Request throughput (req/s):", metrics.request_throughput))
+        if goodput_config_dict:
+            print("{:<40} {:<10.2f}".format("Request goodput (req/s):", metrics.request_goodput))
+        if hasattr(metrics, 'input_throughput'):
+            print("{:<40} {:<10.2f}".format("Input token throughput (tok/s):", metrics.input_throughput))
+        print("{:<40} {:<10.2f}".format("Output token throughput (tok/s):", metrics.output_throughput))
+        
+        # Cancel all tasks and prepare final result
+        for task in tasks:
+            task.cancel()
+        
+        await asyncio.gather(*tasks, return_exceptions=True)
+        result = {'infinite_behaviour': True}
+        
+        # Return both intermediate and final results
+        return result_intermediate, result
 
-    benchmark_duration = time.perf_counter() - benchmark_start_time
+    else:
+        # For standard mode: wait for all tasks to complete
+        outputs = await asyncio.gather(*tasks)
+        
+        if pbar:
+            pbar.close()
+        
+        benchmark_duration = time.perf_counter() - benchmark_start_time
+        
+        # Calculate final metrics
+        metrics, actual_output_lens = calculate_metrics(
+            input_requests=input_requests,
+            outputs=outputs,
+            dur_s=benchmark_duration,
+            tokenizer=tokenizer,
+            selected_percentile_metrics=selected_percentile_metrics,
+            selected_percentiles=selected_percentiles,
+            goodput_config_dict=goodput_config_dict,
+            input_requests_loras=input_requests_loras,
+            input_requests_users=input_requests_users,
+        )
+        
+        # Print final results
+        print("{s:{c}^{n}}".format(s=' Serving Benchmark Result ', n=50, c='='))
+        print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
+        print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
+        print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
+        print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
+        print("{:<40} {:<10.2f}".format("Request throughput (req/s):", metrics.request_throughput))
+        if goodput_config_dict:
+            print("{:<40} {:<10.2f}".format("Request goodput (req/s):", metrics.request_goodput))
+        if hasattr(metrics, 'input_throughput'):
+            print("{:<40} {:<10.2f}".format("Input token throughput (tok/s):", metrics.input_throughput))
+        print("{:<40} {:<10.2f}".format("Output token throughput (tok/s):", metrics.output_throughput))
+        print("{:<40} {:<10.2f}".format("Total Token throughput (tok/s):", metrics.total_token_throughput))
+        
+        # Print detailed metrics for each selected metric type
+        def print_metric_details(metric_name, metric_header):
+            if metric_name in selected_percentile_metrics:
+                print("{s:{c}^{n}}".format(s=metric_header, n=50, c='-'))
+                print("{:<40} {:<10.2f}".format(f"Mean {metric_name.upper()} (ms):", 
+                                              getattr(metrics, f"mean_{metric_name}_ms")))
+                print("{:<40} {:<10.2f}".format(f"Median {metric_name.upper()} (ms):", 
+                                              getattr(metrics, f"median_{metric_name}_ms")))
+                for p, value in getattr(metrics, f"percentiles_{metric_name}_ms"):
+                    p_word = str(int(p)) if int(p) == p else str(p)
+                    print("{:<40} {:<10.2f}".format(f"P{p_word} {metric_name.upper()} (ms):", value))
+        
+        print_metric_details("ttft", "Time to First Token")
+        print_metric_details("tpot", "Time per Output Token (excl. 1st token)")
+        print_metric_details("itl", "Inter-token Latency")
+        print_metric_details("e2el", "End-to-end Latency")
 
-    metrics, actual_output_lens = calculate_metrics(
-        input_requests=input_requests,
-        outputs=outputs,
-        dur_s=benchmark_duration,
-        tokenizer=tokenizer,
-        selected_percentile_metrics=selected_percentile_metrics,
-        selected_percentiles=selected_percentiles,
-        goodput_config_dict=goodput_config_dict,
-    )
+        print("=" * 50)
+        
+        # If profiling was enabled, stop it
+        if profile:
+            print("Stopping profiler...")
+            profile_input = RequestFuncInput(
+                model=model_id,
+                prompt=test_prompt,
+                api_url=base_url + "/stop_profile",
+                prompt_len=test_prompt_len,
+                output_len=test_output_len,
+                logprobs=logprobs,
+            )
+            profile_output = await request_func(request_func_input=profile_input)
+            if profile_output.success:
+                print("Profiler stopped")
+        
+        # Prepare final result data
+        result = {
+            "duration": benchmark_duration,
+            "completed": metrics.completed,
+            "total_input_tokens": metrics.total_input,
+            "total_output_tokens": metrics.total_output,
+            "request_throughput": metrics.request_throughput,
+            "request_goodput": metrics.request_goodput if goodput_config_dict else None,
+            "input_throughput": metrics.input_throughput,
+            "output_throughput": metrics.output_throughput,
+            "total_token_throughput": metrics.total_token_throughput,
+            "input_lens": [output.prompt_len for output in outputs],
+            "output_lens": actual_output_lens,
+            "ttfts": [output.ttft for output in outputs],
+            "itls": [output.itl for output in outputs],
+            "generated_texts": [output.generated_text for output in outputs],
+            "errors": [output.error for output in outputs],
+        }
 
-    print("{s:{c}^{n}}".format(s=' Serving Benchmark Result ', n=50, c='='))
-    print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
-    print("{:<40} {:<10.2f}".format("Benchmark duration (s):",
-                                    benchmark_duration))
-    print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
-    print("{:<40} {:<10}".format("Total generated tokens:",
-                                 metrics.total_output))
-    print("{:<40} {:<10.2f}".format("Request throughput (req/s):",
-                                    metrics.request_throughput))
-    if goodput_config_dict:
-        print("{:<40} {:<10.2f}".format("Request goodput (req/s):",
-                                        metrics.request_goodput))
-    print("{:<40} {:<10.2f}".format("Output token throughput (tok/s):",
-                                    metrics.output_throughput))
-    print("{:<40} {:<10.2f}".format("Total Token throughput (tok/s):",
-                                    metrics.total_token_throughput))
-
-    result = {
-        "duration": benchmark_duration,
-        "completed": metrics.completed,
-        "total_input_tokens": metrics.total_input,
-        "total_output_tokens": metrics.total_output,
-        "request_throughput": metrics.request_throughput,
-        "request_goodput:":
-        metrics.request_goodput if goodput_config_dict else None,
-        "output_throughput": metrics.output_throughput,
-        "total_token_throughput": metrics.total_token_throughput,
-        "input_lens": [output.prompt_len for output in outputs],
-        "output_lens": actual_output_lens,
-        "ttfts": [output.ttft for output in outputs],
-        "itls": [output.itl for output in outputs],
-        "generated_texts": [output.generated_text for output in outputs],
-        "errors": [output.error for output in outputs],
-    }
-
-    def process_one_metric(
-        # E.g., "ttft"
-        metric_attribute_name: str,
-        # E.g., "TTFT"
-        metric_name: str,
-        # E.g., "Time to First Token"
-        metric_header: str,
-    ):
-        # This function prints and adds statistics of the specified
-        # metric.
-        if metric_attribute_name not in selected_percentile_metrics:
-            return
-        print("{s:{c}^{n}}".format(s=metric_header, n=50, c='-'))
-        print("{:<40} {:<10.2f}".format(
-            f"Mean {metric_name} (ms):",
-            getattr(metrics, f"mean_{metric_attribute_name}_ms")))
-        print("{:<40} {:<10.2f}".format(
-            f"Median {metric_name} (ms):",
-            getattr(metrics, f"median_{metric_attribute_name}_ms")))
-        result[f"mean_{metric_attribute_name}_ms"] = getattr(
-            metrics, f"mean_{metric_attribute_name}_ms")
-        result[f"median_{metric_attribute_name}_ms"] = getattr(
-            metrics, f"median_{metric_attribute_name}_ms")
-        result[f"std_{metric_attribute_name}_ms"] = getattr(
-            metrics, f"std_{metric_attribute_name}_ms")
-        for p, value in getattr(metrics,
-                                f"percentiles_{metric_attribute_name}_ms"):
-            p_word = str(int(p)) if int(p) == p else str(p)
-            print("{:<40} {:<10.2f}".format(f"P{p_word} {metric_name} (ms):",
-                                            value))
-            result[f"p{p_word}_{metric_attribute_name}_ms"] = value
-
-    process_one_metric("ttft", "TTFT", "Time to First Token")
-    process_one_metric("tpot", "TPOT",
-                       "Time per Output Token (excl. 1st token)")
-    process_one_metric("itl", "ITL", "Inter-token Latency")
-    process_one_metric("e2el", "E2EL", "End-to-end Latency")
-
-    print("=" * 50)
-
-    return result
-
+        # Add all the metrics to the result
+        result["mean_ttft_ms"] = metrics.mean_ttft_ms
+        result["median_ttft_ms"] = metrics.median_ttft_ms
+        result["std_ttft_ms"] = metrics.std_ttft_ms
+        result["mean_tpot_ms"] = metrics.mean_tpot_ms
+        result["median_tpot_ms"] = metrics.median_tpot_ms
+        result["std_tpot_ms"] = metrics.std_tpot_ms
+        result["mean_itl_ms"] = metrics.mean_itl_ms
+        result["median_itl_ms"] = metrics.median_itl_ms
+        result["std_itl_ms"] = metrics.std_itl_ms
+        result["mean_e2el_ms"] = metrics.mean_e2el_ms
+        result["median_e2el_ms"] = metrics.median_e2el_ms
+        result["std_e2el_ms"] = metrics.std_e2el_ms
+        
+        # Add LoRA and user-specific metrics if available
+        if hasattr(metrics, 'mean_ttfts_ms_by_lora'):
+            result["mean_ttfts_ms_by_lora"] = metrics.mean_ttfts_ms_by_lora
+        if hasattr(metrics, 'mean_ttfts_ms_by_user'):
+            result["mean_ttfts_ms_by_user"] = metrics.mean_ttfts_ms_by_user
+        
+        # Add percentile metrics
+        for metric_name in selected_percentile_metrics:
+            for p, value in getattr(metrics, f"percentiles_{metric_name}_ms", []):
+                p_word = str(int(p)) if int(p) == p else str(p)
+                result[f"p{p_word}_{metric_name}_ms"] = value
+        
+        # For compatibility with the infinite mode, return both intermediate and final results
+        # (they're the same in standard mode)
+        return result, result
 
 def check_goodput_args(args):
     # Check and parse goodput arguments
@@ -539,6 +784,15 @@ def save_to_pytorch_benchmark_format(args: argparse.Namespace,
 
 
 def main(args: argparse.Namespace):
+    """
+    Main function to execute the benchmark based on command line arguments.
+    
+    This function handles:
+    1. Setting up server if requested
+    2. Configuring LoRA and user assignments
+    3. Running the benchmark
+    4. Saving results
+    """
     print(args)
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -552,10 +806,76 @@ def main(args: argparse.Namespace):
     if args.base_url is not None:
         api_url = f"{args.base_url}{args.endpoint}"
         base_url = f"{args.base_url}"
+        metrics_api_url = f"{args.base_url}/metrics/"
+        models_api_url = f"{args.base_url}/v1/models/"
     else:
         api_url = f"http://{args.host}:{args.port}{args.endpoint}"
         base_url = f"http://{args.host}:{args.port}"
+        metrics_api_url = f"http://{args.host}:{args.port}/metrics/"
+        models_api_url = f"http://{args.host}:{args.port}/v1/models/"
 
+    # Helper functions for LoRA and user management
+    def __get_available_loras(models_url, main_model_id):
+        """Get available LoRA adapters from the server."""
+        try:
+            response = requests.get(models_url).json()
+            available_loras = [model["id"] for model in response["data"]]
+            if main_model_id not in available_loras:
+                raise ValueError("Benchmarking with a model that is not available in the server")
+            available_loras.remove(main_model_id)
+            if len(available_loras) == 0:
+                raise ValueError("No available LoRAs in the server")
+            return available_loras
+        except Exception as e:
+            print(f"Error getting available LoRAs: {e}")
+            return []
+        
+    def __assign_users_loras(input_requests, user_lora_request_relation, available_loras):
+        """Assign users and LoRAs to requests based on the specified relation pattern."""
+        input_requests_users = []
+        input_requests_loras = []
+
+        if user_lora_request_relation is None or user_lora_request_relation in ['default', 'balance']:
+            # Balanced distribution of users and LoRAs
+            index = 0
+            while len(input_requests_users) < len(input_requests):
+                input_requests_users.append(str(index))
+                input_requests_loras.append(available_loras[index])
+                index += 1
+                if index >= len(available_loras):
+                    index = 0
+            aux_shuffled_list = list(zip(input_requests_users, input_requests_loras))
+            random.shuffle(aux_shuffled_list)
+            input_requests_users, input_requests_loras = zip(*aux_shuffled_list)
+            input_requests_users = list(input_requests_users)
+            input_requests_loras = list(input_requests_loras)
+        elif user_lora_request_relation == 'imbalance':
+            # Imbalanced distribution: some users make more requests
+            index = 0
+            while len(input_requests_users) < len(input_requests):
+                input_requests_users.append(str(index))
+                input_requests_loras.append(available_loras[index])
+                if index % 2 == 0 and len(input_requests_users) < len(input_requests):
+                    input_requests_users.append(str(index))
+                    input_requests_loras.append(available_loras[index])
+                index += 1
+                if index >= len(available_loras):
+                    index = 0
+            aux_shuffled_list = list(zip(input_requests_users, input_requests_loras))
+            random.shuffle(aux_shuffled_list)
+            input_requests_users, input_requests_loras = zip(*aux_shuffled_list)
+            input_requests_users = list(input_requests_users)
+            input_requests_loras = list(input_requests_loras)
+        else:
+            raise ValueError(f"User assignation {user_lora_request_relation} not implemented")
+
+        values, counts = np.unique(input_requests_users, return_counts=True)
+        print(f"Requests users. Values: {values}. Counts: {counts}")
+        values, counts = np.unique(input_requests_loras, return_counts=True)
+        print(f"Requests loras. Values: {values}. Counts: {counts}")
+        return input_requests_users, input_requests_loras
+
+        
     tokenizer = get_tokenizer(tokenizer_id,
                               tokenizer_mode=tokenizer_mode,
                               trust_remote_code=args.trust_remote_code)
@@ -637,83 +957,189 @@ def main(args: argparse.Namespace):
     gc.collect()
     gc.freeze()
 
-    benchmark_result = asyncio.run(
-        benchmark(
-            backend=backend,
-            api_url=api_url,
-            base_url=base_url,
-            model_id=model_id,
-            model_name=model_name,
-            tokenizer=tokenizer,
-            input_requests=input_requests,
-            logprobs=args.logprobs,
-            request_rate=args.request_rate,
-            burstiness=args.burstiness,
-            disable_tqdm=args.disable_tqdm,
-            profile=args.profile,
-            selected_percentile_metrics=args.percentile_metrics.split(","),
-            selected_percentiles=[
-                float(p) for p in args.metric_percentiles.split(",")
-            ],
-            ignore_eos=args.ignore_eos,
-            goodput_config_dict=goodput_config_dict,
-            max_concurrency=args.max_concurrency,
-            lora_modules=args.lora_modules,
-        ))
+    # Initialize server, metrics collector and benchmark variables
+    server = None
+    open_server_process = None
+    concurrent_metrics_checker = None
 
-    # Save config and results to json
-    if args.save_result:
-        result_json: dict[str, Any] = {}
+    try:
+        # Launch server if requested
+        if hasattr(args, 'launch_server') and args.launch_server:
+            server = Server(args.server_args, args.result_dir)
+            open_server_process = server.run()
 
-        # Setup
-        current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
-        result_json["date"] = current_dt
-        result_json["backend"] = backend
-        result_json["model_id"] = model_id
-        result_json["tokenizer_id"] = tokenizer_id
-        result_json["num_prompts"] = args.num_prompts
+            max_wait_for_server_seconds = 300
+            init_time = time.time()
+            server_started = False
+            while not server_started and time.time() - init_time < max_wait_for_server_seconds:
+                try:
+                    if requests.get(metrics_api_url).status_code == 200:
+                        server_started = True
+                    else:
+                        time.sleep(5)
+                except Exception as e:
+                    time.sleep(5)
+            if not server_started:
+                raise Exception("Server did not start on time")
+            print("Server started")
 
-        # Metadata
-        if args.metadata:
-            for item in args.metadata:
-                if "=" in item:
-                    kvstring = item.split("=")
-                    result_json[kvstring[0].strip()] = kvstring[1].strip()
+        # Set up request rate
+        request_rate = args.request_rate
+        
+        # Handle LoRA/user assignment
+        input_requests_users = None
+        input_requests_loras = None
+        all_available_loras = []
+        
+        if hasattr(args, 'disable_loras_users') and args.disable_loras_users or \
+           hasattr(args, 'restrict_loras') and args.restrict_loras is not None and args.restrict_loras == 0:
+            # Use default model without LoRAs
+            input_requests_users = ["0"] * len(input_requests) 
+            input_requests_loras = [model_id] * len(input_requests)
+        else:
+            # Get available LoRAs from server if models API is available
+            try:
+                all_available_loras = __get_available_loras(models_api_url, model_id)
+                
+                if hasattr(args, 'restrict_loras') and args.restrict_loras is not None:
+                    if len(all_available_loras) < args.restrict_loras:
+                        raise ValueError('Less available LoRAs than the ones that need to be restricted')
+                    available_loras = all_available_loras[:args.restrict_loras]
                 else:
-                    raise ValueError(
-                        "Invalid metadata format. Please use KEY=VALUE format."
-                    )
+                    available_loras = all_available_loras
+                    
+                input_requests_users, input_requests_loras = __assign_users_loras(
+                    input_requests,
+                    args.user_lora_request_relation if hasattr(args, 'user_lora_request_relation') else None,
+                    available_loras
+                )
+                
+                if hasattr(args, 'request_rate_by_lora') and args.request_rate_by_lora is not None:
+                    request_rate = args.request_rate_by_lora * len(available_loras)
+            except Exception as e:
+                print(f"Warning: Failed to get LoRAs from server. Using default model. Error: {e}")
+                input_requests_users = ["0"] * len(input_requests)
+                input_requests_loras = [model_id] * len(input_requests)
 
-        if not args.save_detailed:
-            # Remove fields with too many data points
-            for field in [
-                    "input_lens", "output_lens", "ttfts", "itls",
-                    "generated_texts", "errors"
-            ]:
-                if field in result_json:
-                    del result_json[field]
+        # Set up metrics checker if enabled
+        if not args.disable_log_stats:
+            try:
+                concurrent_metrics_checker = ConcurrentMetricsChecker(
+                    args.result_dir,
+                    metrics_api_url,
+                    list(set(input_requests_users)) if input_requests_users else [],
+                    all_available_loras
+                )
+                concurrent_metrics_checker.start()
+            except Exception as e:
+                print(f"Warning: Failed to start metrics checker. Error: {e}")
 
-        # Traffic
-        result_json["request_rate"] = (args.request_rate if args.request_rate
-                                       < float("inf") else "inf")
-        result_json["burstiness"] = args.burstiness
-        result_json["max_concurrency"] = args.max_concurrency
+        # Run the benchmark
+        benchmark_result = asyncio.run(
+            benchmark(
+                backend=backend,
+                api_url=api_url,
+                base_url=base_url,
+                model_id=model_id,
+                model_name=model_name,
+                tokenizer=tokenizer,
+                input_requests=input_requests,
+                logprobs=args.logprobs,
+                request_rate=request_rate,
+                burstiness=args.burstiness,
+                disable_tqdm=args.disable_tqdm,
+                profile=args.profile,
+                selected_percentile_metrics=args.percentile_metrics.split(","),
+                selected_percentiles=[
+                    float(p) for p in args.metric_percentiles.split(",")
+                ],
+                ignore_eos=args.ignore_eos,
+                goodput_config_dict=goodput_config_dict,
+                max_concurrency=args.max_concurrency,
+                lora_modules=args.lora_modules,
+                infinite_behaviour=args.infinite_behaviour if hasattr(args, 'infinite_behaviour') else False,
+                input_requests_loras=input_requests_loras,
+                input_requests_users=input_requests_users,
+                lora_pre_loading=args.lora_pre_loading if hasattr(args, 'lora_pre_loading') else False,
+            ))
 
-        # Merge with benchmark result
-        result_json = {**result_json, **benchmark_result}
+        # Save benchmark results
+        if args.save_result:
+            result_json = {}
 
-        # Save to file
-        base_model_id = model_id.split("/")[-1]
-        max_concurrency_str = (f"-concurrency{args.max_concurrency}"
-                               if args.max_concurrency is not None else "")
-        file_name = f"{backend}-{args.request_rate}qps{max_concurrency_str}-{base_model_id}-{current_dt}.json"  #noqa
-        if args.result_filename:
-            file_name = args.result_filename
-        if args.result_dir:
-            file_name = os.path.join(args.result_dir, file_name)
-        with open(file_name, "w", encoding='utf-8') as outfile:
-            json.dump(result_json, outfile)
-        save_to_pytorch_benchmark_format(args, result_json, file_name)
+            # Setup
+            current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
+            result_json["date"] = current_dt
+            result_json["backend"] = backend
+            result_json["model_id"] = model_id
+            result_json["tokenizer_id"] = tokenizer_id
+            result_json["num_prompts"] = args.num_prompts
+
+            # Metadata
+            if args.metadata:
+                for item in args.metadata:
+                    if "=" in item:
+                        kvstring = item.split("=")
+                        result_json[kvstring[0].strip()] = kvstring[1].strip()
+                    else:
+                        raise ValueError(
+                            "Invalid metadata format. Please use KEY=VALUE format."
+                        )
+
+            # Traffic
+            result_json["request_rate"] = (args.request_rate if args.request_rate < float("inf") else "inf")
+            if hasattr(args, 'burstiness'):
+                result_json["burstiness"] = args.burstiness
+            result_json["max_concurrency"] = args.max_concurrency
+
+            # Get intermediate and final results from benchmark
+            result_json_intermediate = {**result_json, **benchmark_result[0]}
+            result_json_final = {**result_json, **benchmark_result[1]}
+
+            # Save to file
+            base_model_id = model_id.split("/")[-1]
+            max_concurrency_str = (f"-concurrency{args.max_concurrency}"
+                                 if args.max_concurrency is not None else "")
+            
+            # Save final result
+            file_name = f"{backend}-{args.request_rate}qps{max_concurrency_str}-{base_model_id}-{current_dt}.json"
+            if args.result_filename:
+                file_name = args.result_filename
+            if args.result_dir:
+                file_name = os.path.join(args.result_dir, file_name)
+            with open(file_name, "w", encoding='utf-8') as outfile:
+                json.dump(result_json_final, outfile)
+                
+            # For infinite_behaviour or when intermediate results are different, save them too
+            if hasattr(args, 'infinite_behaviour') and args.infinite_behaviour or benchmark_result[0] != benchmark_result[1]:
+                intermediate_file_name = f"{backend}-{args.request_rate}qps{max_concurrency_str}-{base_model_id}-{current_dt}_intermediate.json"
+                if args.result_dir:
+                    intermediate_file_name = os.path.join(args.result_dir, intermediate_file_name)
+                with open(intermediate_file_name, "w", encoding='utf-8') as outfile:
+                    json.dump(result_json_intermediate, outfile)
+            
+            # Save in PyTorch benchmark format if available
+            if "save_to_pytorch_benchmark_format" in globals():
+                save_to_pytorch_benchmark_format(args, result_json_final, file_name)
+
+    finally:
+        # Clean up resources
+        try:
+            if concurrent_metrics_checker is not None:
+                concurrent_metrics_checker._ConcurrentMetricsChecker__save_metrics()
+                time.sleep(15)  # For correctly monitoring metrics before shutdown
+                concurrent_metrics_checker.terminate()
+                concurrent_metrics_checker.join()
+                print('Concurrent checker terminated')
+        except Exception as e:
+            print(f"Error while terminating metrics checker: {e}")
+            
+        try:
+            if server and open_server_process:
+                server.terminate(open_server_process)
+                print('Server terminated')
+        except Exception as e:
+            print(f"Error while terminating server: {e}")
 
 
 if __name__ == "__main__":
@@ -725,6 +1151,62 @@ if __name__ == "__main__":
         default="vllm",
         choices=list(ASYNC_REQUEST_FUNCS.keys()),
     )
+    
+    # Add new server-related arguments
+    parser.add_argument(
+        "--launch-server",
+        action="store_true",
+        help="Launch server in addition to benchmark",
+    )
+    parser.add_argument(
+        "--server-args",
+        type=str,
+        default="",
+        help="Args to send to the server when launching. Only useful when passing --launch-server as well",
+    )
+    
+    # Add new LoRA and user-related arguments
+    parser.add_argument(
+        '--disable-log-stats',
+        action='store_true',
+        help='Disable logging statistics'
+    )
+    parser.add_argument(
+        '--disable-loras-users',
+        action='store_true',
+        help='Only send requests without LoRA adapters'
+    )
+    parser.add_argument(
+        "--user-lora-request-relation",
+        type=str,
+        default=None,
+        help="Relation of lora<->request<->user. Options: default, balance, imbalance",
+    )
+    parser.add_argument(
+        "--restrict-loras",
+        type=int,
+        default=None,
+        help="Limit the number of available LoRAs to use",
+    )
+    parser.add_argument(
+        '--lora-pre-loading',
+        action='store_true',
+        default=False,
+        help='Pre-load one LoRA in the test previous to the real benchmark'
+    )
+    parser.add_argument(
+        '--infinite-behaviour',
+        action='store_true',
+        default=False,
+        help='Finish benchmark once all requests have been sent'
+    )
+    parser.add_argument(
+        "--request-rate-by-lora",
+        type=float,
+        default=None,
+        help="Number of requests per second by LoRA. Overall rate will be this value multiplied by the number of LoRAs."
+    )
+
     parser.add_argument(
         "--base-url",
         type=str,
