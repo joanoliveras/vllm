@@ -23,11 +23,12 @@ On the client side, run:
         --endpoint /generate_stream
     to the end of the command above.
 """
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import argparse
 import asyncio
 import gc
 import json
-import os
 import random
 import time
 import warnings
@@ -946,6 +947,67 @@ def save_to_pytorch_benchmark_format(args: argparse.Namespace,
         pt_file = f"{os.path.splitext(file_name)[0]}.pytorch.json"
         write_to_json(pt_file, pt_records)
 
+def add_duplicated_loras_to_server_args(server_args, lora_path, n_loras, base_model):
+    """
+    Modify server arguments to include multiple copies of the same LoRA adapter
+    with different names.
+    
+    Args:
+        server_args: Original server arguments string
+        lora_path: Path to the LoRA adapter file to duplicate
+        n_loras: Number of times to duplicate the LoRA adapter
+        
+    Returns:
+        Modified server arguments string with duplicated LoRAs
+    """ 
+    if "--enable-lora" not in server_args:
+        server_args += " --enable-lora"\
+        
+    lora_names = []
+    lora_entries = []
+
+    for i in range(n_loras):
+        lora_name = f"duplicated_lora_{i}"
+        lora_names.append(lora_name)
+        lora_entries.append(f"{lora_name}={lora_path}")
+
+    server_args += " --lora-modules " + " ".join(lora_entries)
+    print(server_args)
+    return server_args,lora_names
+
+def modify_server_args_with_lora_options(args):
+    """
+    Update server arguments based on lora-path and n-loras options.
+    Check if server_args already contains LoRA modules and raise an error if it contains lora-path and n-loras too.
+    
+    Args:
+        args: The command line arguments parsed by argparse
+        
+    Returns:
+        Updated args with modified server_args if applicable
+        
+    Raises:
+        ValueError: If server_args already contains LoRA modules
+    """
+    if hasattr(args, 'n_loras') and args.n_loras > 0 and "--lora-modules" in args.server_args and args.lora_modules:
+        raise ValueError("Server arguments already contain LoRA modules. Cannot add duplicated LoRAs.")
+    elif args.lora_path and args.n_loras > 0:
+        print(f"Adding {args.n_loras} copies of LoRA adapter from {args.lora_path}")
+        try:
+            args.server_args, args.lora_modules = add_duplicated_loras_to_server_args(
+                args.server_args,
+                args.lora_path,
+                args.n_loras,
+                args.model
+            )                
+            print(f"Modified server args: {args.server_args} \n")
+            print(f"Modified LoRA modules: {args.lora_modules} \n")
+        except ValueError as e:
+            print(f"ERROR: {e}")
+            print("Please remove existing LoRA modules from server_args when using --lora-path and --n-loras.")
+            return
+    return args
+
 
 def main(args: argparse.Namespace):
     """
@@ -1178,13 +1240,18 @@ def main(args: argparse.Namespace):
                 # Extract LoRA adapters info from server args
                 available_loras = []
                 if "--enable-lora" in args.server_args and "--lora-modules" in args.server_args:
-                    # Extract the lora modules from server args
-                    lora_modules_str = args.server_args.split("--lora-modules ")[1].split(" ")[0]
-                    # Parse the format 'name=path'
-                    for lora_info in lora_modules_str.split(","):
+                    arg_parts = args.server_args.split()
+                    lora_modules_index = arg_parts.index("--lora-modules")
+
+                    i = lora_modules_index + 1
+                    while i < len(arg_parts) and not arg_parts[i].startswith("--"):
+                        lora_info = arg_parts[i]
+                        # Parse the format 'name=path'
                         if "=" in lora_info:
                             name, _ = lora_info.split("=", 1)
                             available_loras.append(name)
+                        i += 1
+                print(f"Extracted LoRA adapters for router: {available_loras}")
 
                 # Start the router
                 print("Starting vLLM router...")
@@ -1200,7 +1267,6 @@ def main(args: argparse.Namespace):
                 # Update API URL to point to the router
                 api_url = f"http://{args.host}:{args.router_port}{args.endpoint}"
                 base_url = f"http://{args.host}:{args.router_port}"
-                metrics_api_url = f"http://{args.host}:{args.router_port}/metrics/"
                 models_api_url = f"http://{args.host}:{args.router_port}/v1/models/"
 
                 # Wait for router to start
@@ -1280,16 +1346,32 @@ def main(args: argparse.Namespace):
 
         # Set up metrics checker if enabled
         if not args.disable_log_stats:
-            try:
-                concurrent_metrics_checker = ConcurrentMetricsChecker(
-                    args.result_dir,
-                    metrics_api_url,
-                    list(set(input_requests_users)) if input_requests_users else [],
-                    all_available_loras
-                )
-                concurrent_metrics_checker.start()
-            except Exception as e:
-                print(f"Warning: Failed to start metrics checker. Error: {e}")
+            if args.num_servers > 1:
+                metrics_checkers = []
+                try:
+                    for i, server_metrics_url in enumerate(metrics_api_urls):
+                        server_metrics_checker = ConcurrentMetricsChecker(
+                            os.path.join(args.result_dir, f'server_{i}'),
+                            server_metrics_url,
+                            list(set(input_requests_users)) if input_requests_users else [],
+                            all_available_loras
+                        )
+                        server_metrics_checker.start()
+                        metrics_checkers.append(server_metrics_checker)
+                        
+                except Exception as e:
+                    print(f"Warning: Failed to start server metrics checkers. Error: {e}")
+            else:    
+                try:
+                    concurrent_metrics_checker = ConcurrentMetricsChecker(
+                        args.result_dir,
+                        metrics_api_url,
+                        list(set(input_requests_users)) if input_requests_users else [],
+                        all_available_loras
+                    )
+                    concurrent_metrics_checker.start()
+                except Exception as e:
+                    print(f"Warning: Failed to start metrics checker. Error: {e}")
 
         # Run the benchmark
         benchmark_result = asyncio.run(
@@ -1383,11 +1465,21 @@ def main(args: argparse.Namespace):
         # Clean up resources
         try:
             if concurrent_metrics_checker is not None:
-                concurrent_metrics_checker._ConcurrentMetricsChecker__save_metrics()
-                time.sleep(15)  # For correctly monitoring metrics before shutdown
-                concurrent_metrics_checker.terminate()
-                concurrent_metrics_checker.join()
+                concurrent_metrics_checker.shutdown()
+                concurrent_metrics_checker.join(timeout=30)  # Wait up to 30 seconds
+                if concurrent_metrics_checker.is_alive():
+                    # Process didn't exit in time, force termination
+                    concurrent_metrics_checker.terminate()
                 print('Concurrent checker terminated')
+
+            if 'metrics_checkers' in locals() and metrics_checkers:
+                for checker in metrics_checkers:
+                    checker.shutdown()
+                    checker.join(timeout=30)
+                    if checker.is_alive():
+                        # Process didn't exit in time, force termination
+                        checker.terminate()
+                
         except Exception as e:
             print(f"Error while terminating metrics checker: {e}")
             
@@ -1415,6 +1507,19 @@ if __name__ == "__main__":
         type=str,
         default="vllm",
         choices=list(ASYNC_REQUEST_FUNCS.keys()),
+    )
+    #LoRA variables to load the same adapter as n different adapters.
+    parser.add_argument(
+        "--lora-path",
+        type=str,
+        default=None,
+        help="Path to where the LoRA adapter that will be duplicated --n-loras times is stored.",
+    )
+    parser.add_argument(
+        "--n-loras",
+        type=int,
+        default=0,
+        help="Number of times the LoRA adapter from --lora-path will be loaded, all as different adapters.",
     )
     # Router variables, used when using --num-servers > 1.
     parser.add_argument(
@@ -1767,5 +1872,5 @@ if __name__ == "__main__":
                         "script chooses a LoRA module at random.")
 
     args = parser.parse_args()
-
+    args=modify_server_args_with_lora_options(args)
     main(args)

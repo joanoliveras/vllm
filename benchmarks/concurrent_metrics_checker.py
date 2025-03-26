@@ -3,7 +3,7 @@ import re
 import signal
 import sys
 import time
-from multiprocessing import Process
+from multiprocessing import Process, Event
 from typing import List
 
 import numpy as np
@@ -20,8 +20,9 @@ class ConcurrentMetricsChecker(Process):
         self.metrics_api_url = metrics_api_url
         self.users = users
         self.available_loras = available_loras
-        signal.signal(signal.SIGTERM, self.__signal_term_handler)
+        self.exit_event = Event()
 
+        os.makedirs(self.output_path, exist_ok=True)
         self.time = []
         self.gpu_cache_usage_perc = []
         self.num_running = []
@@ -64,126 +65,113 @@ class ConcurrentMetricsChecker(Process):
             return float(value)
 
         start_time = time.perf_counter()
-        while True:
+        while not self.exit_event.is_set():
             if DEBUG_NOT_FINISHING_REQUESTS and (time.perf_counter() - start_time) > 300:
                 self.__save_metrics()
-            try:
-                self.time.append(time.perf_counter() - start_time)
-                metrics_response = requests.get(self.metrics_api_url).text
 
-                self.gpu_cache_usage_perc.append(
+            self.time.append(time.perf_counter() - start_time)
+            metrics_response = requests.get(self.metrics_api_url).text
+            self.gpu_cache_usage_perc.append(
+                find_prometheus_metric_value(
+                    f"gpu_cache_usage_perc",
+                    metrics_response
+                )
+            )
+            self.num_running.append(
+                find_prometheus_metric_value(
+                    f"num_requests_running",
+                    metrics_response
+                )
+            )
+            self.num_waiting.append(
+                find_prometheus_metric_value(
+                    f"num_requests_waiting",
+                    metrics_response
+                )
+            )
+            self.num_preempted.append(
+                find_prometheus_metric_value(
+                    f"num_preemptions_total",
+                    metrics_response
+                )
+            )
+            self.num_preempted_workload.append(
+                find_prometheus_metric_value(
+                    f"num_preemptions_workload_total", # Not found in vllm metrics.
+                    metrics_response
+                )
+            )
+            self.finished.append(
+                find_prometheus_metric_value(
+                    f"request_success_total",
+                    metrics_response
+                )
+            )
+            self.processed_tokens_prompt.append(
+                find_prometheus_metric_value(
+                    f"prompt_tokens_total",
+                    metrics_response
+                )
+            )
+            self.processed_tokens_generation.append(
+                find_prometheus_metric_value(
+                    f"generation_tokens_total",
+                    metrics_response
+                )
+            )
+            for index in range(len(self.available_loras) + 1):
+                self.running_by_adapter[index].append(
                     find_prometheus_metric_value(
-                        f"gpu_cache_usage_perc",
+                        f"running_by_adapter_{index}", # Not found in vllm metrics.
                         metrics_response
                     )
                 )
-
-                self.num_running.append(
+                self.waiting_by_adapter[index].append(
                     find_prometheus_metric_value(
-                        f"num_requests_running",
+                        f"waiting_by_adapter_{index}", # Not found in vllm metrics.
                         metrics_response
                     )
                 )
-
-                self.num_waiting.append(
+            '''
+            for user in self.users:
+                self.vtc_cost_by_user[user].append(
                     find_prometheus_metric_value(
-                        f"num_requests_waiting",
+                        f"vtc_cost_by_user_{user}",
                         metrics_response
                     )
                 )
-
-                self.num_preempted.append(
+                self.vtc_waiting_by_user[user].append(
                     find_prometheus_metric_value(
-                        f"num_preemptions_total",
+                        f"vtc_waiting_by_user_{user}",
                         metrics_response
                     )
                 )
-
-                self.num_preempted_workload.append(
+                self.vtc_running_by_user[user].append(
                     find_prometheus_metric_value(
-                        f"num_preemptions_workload_total",
+                        f"vtc_running_by_user_{user}",
                         metrics_response
                     )
                 )
-
-                self.finished.append(
+            for lora in self.available_loras:
+                self.polling_waiting_by_queue[lora].append(
                     find_prometheus_metric_value(
-                        f"request_success_total",
+                        f"polling_waiting_by_queue_{lora}",
                         metrics_response
                     )
                 )
-
-                self.processed_tokens_prompt.append(
+                self.polling_running_by_queue[lora].append(
                     find_prometheus_metric_value(
-                        f"prompt_tokens_total",
+                        f"polling_running_by_queue_{lora}",
                         metrics_response
                     )
                 )
-                self.processed_tokens_generation.append(
-                    find_prometheus_metric_value(
-                        f"generation_tokens_total",
-                        metrics_response
-                    )
-                )
-
-                for index in range(len(self.available_loras) + 1):
-                    self.running_by_adapter[index].append(
-                        find_prometheus_metric_value(
-                            f"running_by_adapter_{index}",
-                            metrics_response
-                        )
-                    )
-                    self.waiting_by_adapter[index].append(
-                        find_prometheus_metric_value(
-                            f"waiting_by_adapter_{index}",
-                            metrics_response
-                        )
-                    )
-
-                '''
-                for user in self.users:
-                    self.vtc_cost_by_user[user].append(
-                        find_prometheus_metric_value(
-                            f"vtc_cost_by_user_{user}",
-                            metrics_response
-                        )
-                    )
-                    self.vtc_waiting_by_user[user].append(
-                        find_prometheus_metric_value(
-                            f"vtc_waiting_by_user_{user}",
-                            metrics_response
-                        )
-                    )
-                    self.vtc_running_by_user[user].append(
-                        find_prometheus_metric_value(
-                            f"vtc_running_by_user_{user}",
-                            metrics_response
-                        )
-                    )
-
-                for lora in self.available_loras:
-                    self.polling_waiting_by_queue[lora].append(
-                        find_prometheus_metric_value(
-                            f"polling_waiting_by_queue_{lora}",
-                            metrics_response
-                        )
-                    )
-                    self.polling_running_by_queue[lora].append(
-                        find_prometheus_metric_value(
-                            f"polling_running_by_queue_{lora}",
-                            metrics_response
-                        )
-                    )
-                '''
-
-            except Exception as e:
-                print(f'Error while running usage checker: {e}')
-            finally:
-                time.sleep(1)
-
-    def __signal_term_handler(self, signal, frame):
+            '''
+            time.sleep(1)
         self.__save_metrics()
-        sys.exit(0)
+
+    def shutdown(self):
+        """Request a graceful shutdown"""
+        self.exit_event.set()
 
     def __save_metrics(self):
         np.save(
